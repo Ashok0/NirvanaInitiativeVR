@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "melonmcp": {
+      "command": "python",
+      "args": ["C:\\Users\\Ashok\\Downloads\\AI2\\MelonMCP\\mcp-bridge.py", "--host", "localhost", "--port", "27015"]
+    }
+  }
+}

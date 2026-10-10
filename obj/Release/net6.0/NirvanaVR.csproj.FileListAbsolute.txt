@@ -1,0 +1,11 @@
+C:\dev\NirvanaVR\obj\Release\net6.0\NirvanaVR.csproj.AssemblyReference.cache
+C:\dev\NirvanaVR\obj\Release\net6.0\NirvanaVR.GeneratedMSBuildEditorConfig.editorconfig
+C:\dev\NirvanaVR\obj\Release\net6.0\NirvanaVR.csproj.CoreCompileInputs.cache
+C:\dev\NirvanaVR\bin\Release\net6.0\openvr_api.dll
+C:\dev\NirvanaVR\bin\Release\net6.0\NirvanaVR.deps.json
+C:\dev\NirvanaVR\bin\Release\net6.0\NirvanaVR.dll
+C:\dev\NirvanaVR\bin\Release\net6.0\NirvanaVR.pdb
+C:\dev\NirvanaVR\obj\Release\net6.0\NirvanaVR.dll
+C:\dev\NirvanaVR\obj\Release\net6.0\refint\NirvanaVR.dll
+C:\dev\NirvanaVR\obj\Release\net6.0\NirvanaVR.pdb
+C:\dev\NirvanaVR\obj\Release\net6.0\ref\NirvanaVR.dll

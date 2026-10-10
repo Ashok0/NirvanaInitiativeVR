@@ -1,0 +1,100 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>NirvanaVR</AssemblyName>
+    <RootNamespace>NirvanaVR</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GameDir>C:\Program Files (x86)\Steam\steamapps\common\AI The Somnium Files 2</GameDir>
+    <MelonNet6Dir>$(GameDir)\MelonLoader\net6</MelonNet6Dir>
+    <Il2CppAssembliesDir>$(GameDir)\MelonLoader\Il2CppAssemblies</Il2CppAssembliesDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- MelonLoader / Harmony / Il2CppInterop - already present at runtime, never copy local -->
+    <Reference Include="MelonLoader">
+      <HintPath>$(MelonNet6Dir)\MelonLoader.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(MelonNet6Dir)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>$(MelonNet6Dir)\Il2CppInterop.Runtime.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+
+    <!-- Il2Cpp game / Unity assemblies (MelonLoader\Il2CppAssemblies, NOT DummyDll) -->
+    <!-- Il2Cpp's own mscorlib surrogate - required whenever code touches Il2Cpp's
+         Object/Action<,> etc. (implicit null checks, the RenderPipelineManager event casts) -->
+    <Reference Include="Il2Cppmscorlib">
+      <HintPath>$(Il2CppAssembliesDir)\Il2Cppmscorlib.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <!-- UnityEngine.Input / KeyCode live in this module, not UnityEngine(.CoreModule) -->
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(Il2CppAssembliesDir)\UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(Il2CppAssembliesDir)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(Il2CppAssembliesDir)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(Il2CppAssembliesDir)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <!-- On disk this is named Il2CppCinemachine.dll (the Il2Cpp-prefixed build of Cinemachine.dll) -->
+    <Reference Include="Il2CppCinemachine">
+      <HintPath>$(Il2CppAssembliesDir)\Il2CppCinemachine.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <Reference Include="Unity.RenderPipelines.Core.Runtime">
+      <HintPath>$(Il2CppAssembliesDir)\Unity.RenderPipelines.Core.Runtime.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <Reference Include="Unity.RenderPipelines.Universal.Runtime">
+      <HintPath>$(Il2CppAssembliesDir)\Unity.RenderPipelines.Universal.Runtime.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Explicitly linked rather than picked up by the default SDK glob -->
+    <Compile Remove="openvr_api.cs" />
+    <Compile Include="openvr_api.cs" Link="openvr_api.cs" Condition="Exists('openvr_api.cs')" />
+
+    <!--
+      openvr_api.dll is a native (unmanaged) DLL, not a .NET assembly - it must NOT be added
+      as a <Reference> (MSBuild will warn "PE image does not have metadata" and the build
+      will fail). openvr_api.cs P/Invokes into it via [DllImport("openvr_api")], so it just
+      needs to sit next to NirvanaVR.dll at runtime. Copy it from the Pathologic 2 project
+      into this folder; deploy.bat also xcopies it into the Mods folder alongside the mod.
+    -->
+    <None Include="openvr_api.dll" Condition="Exists('openvr_api.dll')"
+          CopyToOutputDirectory="PreserveNewest" Link="openvr_api.dll" />
+  </ItemGroup>
+
+</Project>
