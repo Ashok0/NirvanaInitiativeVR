@@ -58,9 +58,6 @@ namespace NirvanaVR
             if (Input.GetKeyDown(KeyCode.F7))
                 VRHead.ToggleLeftEyeScreenMirror();
 
-            if (Input.GetKeyDown(KeyCode.F8))
-                VRHead.ToggleEyeProjection();
-
             if (Input.GetKeyDown(KeyCode.F9))
                 VRHead.RecenterYaw();
 
