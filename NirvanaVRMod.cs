@@ -36,12 +36,19 @@ namespace NirvanaVR
         public override void OnLateUpdate()
         {
             VRHead.PumpPoses();
+            VRUI.Update();
 
             if (Input.GetKeyDown(KeyCode.F1))
                 VRHead.AdjustHeadTranslationScale(-0.25f);
 
             if (Input.GetKeyDown(KeyCode.F2))
                 VRHead.AdjustHeadTranslationScale(0.25f);
+
+            if (Input.GetKeyDown(KeyCode.PageUp))
+                VRUI.AdjustScale(0.04f);
+
+            if (Input.GetKeyDown(KeyCode.PageDown))
+                VRUI.AdjustScale(-0.04f);
 
             if (Input.GetKeyDown(KeyCode.F3))
                 VRHead.AdjustCameraPullback(-0.25f);
@@ -71,6 +78,23 @@ namespace NirvanaVR
                 VRHead.ToggleGameFrameMirror();
 
             DisableCinemachineHeadControl();
+        }
+
+        /// <summary>
+        /// Draws the interface back onto the monitor. Redirecting the canvases through
+        /// UICamera into a RenderTexture is what got them into the headset, but it also took
+        /// them off the backbuffer, leaving the flat view without dialogue or menus. OnGUI
+        /// runs after all camera rendering, so drawing the captured texture here puts it
+        /// back on screen without disturbing what the headset receives.
+        /// </summary>
+        public override void OnGUI()
+        {
+            var ui = VRUI.UiTexture;
+            if (ui == null)
+                return;
+
+            GUI.DrawTexture(new Rect(0f, 0f, Screen.width, Screen.height), ui,
+                ScaleMode.StretchToFill, true);
         }
 
         /// <summary>

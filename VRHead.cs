@@ -254,6 +254,10 @@ namespace NirvanaVR
             // selects the part matching the eye's real frustum.
             BlitEye(_leftEyeTexture, _leftSubmitTexture, _leftCrop);
             BlitEye(_rightEyeTexture, _rightSubmitTexture, _rightCrop);
+
+            // The game's 2D interface, drawn over both eyes - see VRUI.
+            VRUI.Composite(_leftSubmitTexture, EVREye.Eye_Left);
+            VRUI.Composite(_rightSubmitTexture, EVREye.Eye_Right);
         }
 
         private static void BlitEye(RenderTexture source, RenderTexture destination, Rect crop)
@@ -438,6 +442,33 @@ namespace NirvanaVR
             }
 
             ApplySymmetricEyeFrustum(eyeCamera, eye);
+        }
+
+        /// <summary>
+        /// This eye's offset from the head and its frustum tangents, so overlays can be
+        /// placed at a consistent ANGULAR position in both eyes rather than at the same
+        /// texture coordinates. The two eyes have differently off-centre frustums, so equal
+        /// texture positions mean unequal angles - which reads as double vision.
+        /// </summary>
+        public static bool TryGetEyeView(EVREye eye, out Vector3 eyeOffset,
+            out float left, out float right, out float bottom, out float top)
+        {
+            eyeOffset = Vector3.zero;
+            left = right = bottom = top = 0f;
+
+            if (!_initialized || _system == null)
+                return false;
+
+            eyeOffset = GetPosition(_system.GetEyeToHeadTransform(eye)) * _ipdScale;
+
+            float rawLeft = 0f, rawRight = 0f, rawTop = 0f, rawBottom = 0f;
+            _system.GetProjectionRaw(eye, ref rawLeft, ref rawRight, ref rawTop, ref rawBottom);
+
+            left = Mathf.Min(rawLeft, rawRight);
+            right = Mathf.Max(rawLeft, rawRight);
+            bottom = Mathf.Min(rawTop, rawBottom);
+            top = Mathf.Max(rawTop, rawBottom);
+            return right > left && top > bottom;
         }
 
         /// <summary>Zeroes the yaw of the current HMD orientation as the new forward.</summary>

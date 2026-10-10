@@ -52,6 +52,17 @@
       <Private>false</Private>
       <CopyLocal>false</CopyLocal>
     </Reference>
+    <!-- Canvas / RenderMode, for redirecting the game's UI into the headset -->
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(Il2CppAssembliesDir)\UnityEngine.UIModule.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(Il2CppAssembliesDir)\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+      <CopyLocal>false</CopyLocal>
+    </Reference>
     <Reference Include="UnityEngine.CoreModule">
       <HintPath>$(Il2CppAssembliesDir)\UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
