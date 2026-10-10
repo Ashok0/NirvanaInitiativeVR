@@ -65,18 +65,41 @@ namespace NirvanaVR
         private static readonly VRTextureBounds_t FullTextureBounds =
             new VRTextureBounds_t { uMin = 0f, vMin = 1f, uMax = 1f, vMax = 0f };
 
+        // Per-eye sub-rectangle of the rendered image that corresponds to that eye's true
+        // frustum. We render a symmetric frustum big enough to contain the eye's asymmetric
+        // one (symmetric renders correctly; asymmetric renders nothing but background) and
+        // let the compositor crop. The mapping is linear in tangent space, so the result is
+        // geometrically exact rather than an approximation.
+        private static VRTextureBounds_t _leftBounds = new VRTextureBounds_t { uMin = 0f, vMin = 1f, uMax = 1f, vMax = 0f };
+        private static VRTextureBounds_t _rightBounds = new VRTextureBounds_t { uMin = 0f, vMin = 1f, uMax = 1f, vMax = 0f };
+
+        // The same crop expressed as a UV rectangle, applied by our own blit so the eye's
+        // view fills the whole submit texture. Full-frame by default.
+        private static Rect _leftCrop = new Rect(0f, 0f, 1f, 1f);
+        private static Rect _rightCrop = new Rect(0f, 0f, 1f, 1f);
+
         // One stable RenderTexture per eye, created once and never swapped. An earlier
         // version double-buffered these and re-pointed camera.targetTexture every frame to
         // dodge a compositor race - but the real cause of that race was submitting from
         // inside the render callback (see OnEndCameraRendering), and the buffer juggling
         // only desynced what was rendered from what was submitted.
+        // Two textures per eye, the same split the Pathologic 2 mod uses:
+        //
+        //  - the RENDER target, whose descriptor is cloned from the game's own so the
+        //    pipeline is willing to render a camera into it. This game's is
+        //    RGB111110Float - a packed HDR format the OpenVR compositor rejects outright
+        //    with TextureUsesUnsupportedFormat.
+        //  - the SUBMIT texture, a plain ARGB32 sRGB surface the compositor accepts. We
+        //    blit render -> submit each frame, which also does the linear->gamma encode.
         private static RenderTexture _leftEyeTexture;
         private static RenderTexture _rightEyeTexture;
+        private static RenderTexture _leftSubmitTexture;
+        private static RenderTexture _rightSubmitTexture;
 
         // TEMP EXPERIMENT toggle - see the comment where the eye textures are allocated.
         // F11 flips this at runtime and forces a rig rebuild, so we can compare both sizes
         // in a single session instead of one game restart per attempt.
-        private static bool UseScreenSizedEyeTextures = true;
+        private static bool UseScreenSizedEyeTextures = false;
 
         // Mono mirror mode (F12). Instead of rendering the scene ourselves, copy the game's
         // own finished frame into both eye textures. No parallax, but the view is still
@@ -86,6 +109,63 @@ namespace NirvanaVR
         // fault is purely in our eye cameras' rendering.
         private static bool _mirrorGameFrameToEyes = true;
         private static Camera _gameMainCamera;
+
+        // Which eye the game's own render is being aimed at this frame. Camera.Render()
+        // does nothing under a Scriptable Render Pipeline (it fails silently - no
+        // exception, no pixels), so we can't render the scene on demand. Instead we ride
+        // the game's single normal render: offset the camera to one eye, let the game draw
+        // its frame, copy the result to that eye, and alternate. Both eyes stay submitted
+        // every frame, so each simply refreshes at half the game's rate.
+        private static EVREye _currentEye = EVREye.Eye_Left;
+
+        // The eye the game's most recent render was actually set up for. Read next frame,
+        // when that render's result is sitting in the game's target texture ready to copy.
+        private static EVREye _eyeOfLastRender = EVREye.Eye_Left;
+
+        // Whether to override the game camera's projection with the HMD's per-eye frustum.
+        // Off by default: doing so renders grey. Parallax works without it; only the field
+        // of view is then the game's rather than the headset's.
+        private static bool _applyEyeProjection;
+
+        // Widen the game's FOV to the headset's using camera.fieldOfView, which leaves
+        // Unity's implicit projection in place. On by default in stereo: a ~45 degree image
+        // stretched across ~100+ degrees of lens can't fuse no matter how good the parallax.
+        // Multiplier on the eye separation - larger means stronger depth. F5/F6 adjust.
+        private static float _ipdScale = 1f;
+
+        // Metres to pull the viewpoint back along the view axis. F3/F4 adjust.
+        private static float _cameraPullback;
+
+        // Scales the crop relative to what was rendered. Only used by the symmetric+crop
+        // fallback; the asymmetric path needs no crop at all.
+        private static float _fovCalibration = 1f;
+
+        // Submit each eye the instant it finishes rendering (as Pathologic 2 does) instead
+        // of both together a frame later. F8 toggles. Submitting mid-pipeline previously
+        // hung the compositor, so this stays opt-in until proven safe here.
+        private static bool _submitImmediately;
+
+        // Scales HMD translation into game units - effectively the world scale. F1/F2 adjust.
+        private static float _headTranslationScale = 1f;
+
+        // Take only the game camera's yaw as the base for the head pose, so the headset
+        // defines which way is up. F10 toggles, for comparison.
+        private static bool _levelHorizon = true;
+
+        // Use the headset's true off-centre frustum on the eye cameras (F8 toggles). This is
+        // what Pathologic 2 does and why it has no fishbowl distortion.
+        private static bool _useAsymmetricEyeProjection = true;
+
+        private static bool _matchHmdFieldOfView = true;
+        private static float _originalFieldOfView;
+        private static bool _haveOriginalFieldOfView;
+
+        // CONTROL TEST (F7): assign an explicit projection matrix that Unity itself
+        // generates, with the camera's own parameters - i.e. mathematically identical to
+        // what the camera already uses, differing only in being set explicitly. If this
+        // greys the screen too, the pipeline breaks on ANY explicit projection and the
+        // OpenVR matrix is blameless; if it renders fine, our matrix is the problem.
+        private static bool _applyUnityPerspectiveTest;
 
         public static void Init()
         {
@@ -131,30 +211,30 @@ namespace NirvanaVR
             if (compositor == null)
                 return;
 
-            // Submit whatever eye textures finished rendering last frame - see the comment
-            // on OnEndCameraRendering. Doing this first, before WaitGetPoses, keeps a
-            // stable per-frame order: submit last frame's eyes, then fetch this frame's
-            // poses.
-            if (_pendingLeftSubmit != null)
+            // Copy FIRST, then submit. The eye render targets hold last frame's render, so
+            // copying before submitting hands the compositor a one-frame-old image instead
+            // of a two-frame-old one. The old order (submit, then copy) meant we submitted
+            // the copy made last frame - which had itself captured the frame before that -
+            // while the compositor reprojected it as if current. That extra frame of stale
+            // pose is what makes the world swim and warp as the head turns.
+            MirrorGameFrameToEyes();
+            CaptureRenderedEye();
+
+            // Skipped when submitting immediately from the render callback instead.
+            if (!_submitImmediately && _stereoRigCreated
+                && _leftSubmitTexture != null && _rightSubmitTexture != null)
             {
-                ProbeEyeTexture(_pendingLeftSubmit);
-                SubmitEye(EVREye.Eye_Left, _pendingLeftSubmit);
-                _pendingLeftSubmit = null;
+                ProbeEyeTexture(_leftSubmitTexture);
+                SubmitEye(EVREye.Eye_Left, _leftSubmitTexture);
+                SubmitEye(EVREye.Eye_Right, _rightSubmitTexture);
             }
 
-            if (_pendingRightSubmit != null)
-            {
-                SubmitEye(EVREye.Eye_Right, _pendingRightSubmit);
-                _pendingRightSubmit = null;
-            }
-
+            // Submit-then-wait is the intended OpenVR order: the wait blocks until the
+            // compositor is ready for the next frame, so the poses we get back are the
+            // freshest possible for the render we are about to drive.
             compositor.WaitGetPoses(RenderPoses, GamePoses);
 
-            // The eye cameras are simply left enabled with a fixed target texture, and the
-            // pipeline renders them every frame like any other camera. Application
-            // .targetFrameRate (set in Init) already paces us to the HMD's refresh rate.
             ReassertEyeCameras();
-            MirrorGameFrameToEyes();
 
             var hmdPose = RenderPoses[OpenVR.k_unTrackedDeviceIndex_Hmd];
             if (!hmdPose.bPoseIsValid)
@@ -163,6 +243,55 @@ namespace NirvanaVR
             var m = hmdPose.mDeviceToAbsoluteTracking;
             _hmdPosRaw = GetPosition(m);
             _hmdRotRaw = GetRotation(m);
+        }
+
+        /// <summary>
+        /// Copies both eye cameras' output into the textures we hand to the compositor.
+        /// Runs from LateUpdate, where the previous frame's rendering is complete and we
+        /// are well clear of the pipeline's own work - Graphics.Blit executes immediately
+        /// and issuing it mid-pipeline produced a flat grey image.
+        ///
+        /// The eye cameras render into targets whose descriptor is cloned from the game's
+        /// (RGB111110Float - the only format this pipeline will render a camera into), and
+        /// this copy converts that HDR content into the 8-bit sRGB surface OpenVR accepts.
+        /// Both eyes come from the SAME frame, so there is no temporal mismatch between them.
+        /// </summary>
+        private static void CaptureRenderedEye()
+        {
+            if (_mirrorGameFrameToEyes || !_stereoRigCreated)
+                return;
+
+            if (_leftEyeTexture == null || _rightEyeTexture == null
+                || _leftSubmitTexture == null || _rightSubmitTexture == null)
+                return;
+
+            // Blit the eye's sub-rectangle so it fills the submit texture. With the true
+            // asymmetric frustum the crop is the whole frame; with the symmetric fallback it
+            // selects the part matching the eye's real frustum.
+            BlitEye(_leftEyeTexture, _leftSubmitTexture, _leftCrop);
+            BlitEye(_rightEyeTexture, _rightSubmitTexture, _rightCrop);
+        }
+
+        private static void CopyAndSubmitEye(EVREye eye, RenderTexture source, RenderTexture destination, Rect crop)
+        {
+            if (source == null || destination == null)
+                return;
+
+            BlitEye(source, destination, crop);
+            SubmitEye(eye, destination);
+        }
+
+        private static void BlitEye(RenderTexture source, RenderTexture destination, Rect crop)
+        {
+            if (crop.width <= 0f || crop.height <= 0f)
+            {
+                Graphics.Blit(source, destination);
+                return;
+            }
+
+            Graphics.Blit(source, destination,
+                new Vector2(crop.width, crop.height),
+                new Vector2(crop.x, crop.y));
         }
 
         /// <summary>
@@ -181,14 +310,12 @@ namespace NirvanaVR
             // In menus the game renders straight to the screen, so there's no frame to
             // copy - leave the eye cameras' own output alone in that case.
             var source = _gameMainCamera.targetTexture;
-            if (source == null || _leftEyeTexture == null || _rightEyeTexture == null)
+            if (source == null || _leftSubmitTexture == null || _rightSubmitTexture == null)
                 return;
 
-            Graphics.Blit(source, _leftEyeTexture);
-            Graphics.Blit(source, _rightEyeTexture);
+            Graphics.Blit(source, _leftSubmitTexture);
+            Graphics.Blit(source, _rightSubmitTexture);
 
-            _pendingLeftSubmit = _leftEyeTexture;
-            _pendingRightSubmit = _rightEyeTexture;
         }
 
         /// <summary>
@@ -209,11 +336,133 @@ namespace NirvanaVR
 
         private static void ReassertEyeCamera(Camera eyeCamera, EVREye eye, Matrix4x4 projection)
         {
+            // Parented to the game camera, so this local offset rides on top of the head
+            // pose written during the game camera's own render. Scaled by _ipdScale (F5/F6).
             var eyeToHead = _system.GetEyeToHeadTransform(eye);
-            eyeCamera.transform.localPosition = GetPosition(eyeToHead);
-            eyeCamera.transform.localRotation = GetRotation(eyeToHead);
-            eyeCamera.projectionMatrix = projection;
+            eyeCamera.transform.localPosition = GetPosition(eyeToHead) * _ipdScale;
+
+            // Identity, exactly as Pathologic 2 does - it takes the eye's POSITION from
+            // eyeToHead but deliberately ignores its rotation. Any error in that quaternion
+            // rotates the two eyes differently, which introduces vertical disparity that
+            // grows towards the edges of the field and changes with head angle: a very close
+            // match for the distortion here, which survives both narrow FOV and no crop.
+            eyeCamera.transform.localRotation = Quaternion.identity;
             eyeCamera.useOcclusionCulling = false;
+            eyeCamera.nearClipPlane = _gameMainCamera != null ? _gameMainCamera.nearClipPlane : eyeCamera.nearClipPlane;
+            eyeCamera.farClipPlane = _gameMainCamera != null ? _gameMainCamera.farClipPlane : eyeCamera.farClipPlane;
+
+            ApplyEyeCameraProjection(eyeCamera, eye);
+        }
+
+        /// <summary>
+        /// Gives an eye camera its frustum. Two ways, switchable with F8:
+        ///
+        ///  - asymmetric (default): the headset's true off-centre frustum, exactly what
+        ///    Pathologic 2 uses. Geometrically correct, so no fishbowl warping. This greyed
+        ///    the screen when applied to the GAME's camera, but that camera also feeds the
+        ///    game's own post-processing; a private camera of ours may well tolerate it.
+        ///  - symmetric + crop: a wider symmetric frustum, with the eye's real extents
+        ///    selected afterwards via the compositor's texture bounds. Always renders, but
+        ///    the crop is an approximation and warps as the head moves.
+        /// </summary>
+        private static void ApplyEyeCameraProjection(Camera eyeCamera, EVREye eye)
+        {
+            if (_useAsymmetricEyeProjection)
+            {
+                // Build the off-centre frustum with Unity's own constructor from the raw
+                // tangents, rather than copying OpenVR's matrix element-for-element. Those
+                // two disagree about the vertical convention - OpenVR reports top negative
+                // and bottom positive, which flips the sign of the vertical off-centre term
+                // when pasted straight into a Unity matrix. Matrix4x4.Frustum takes plain
+                // edge distances at the near plane and cannot be misinterpreted.
+                float rawLeft = 0f, rawRight = 0f, rawTop = 0f, rawBottom = 0f;
+                _system.GetProjectionRaw(eye, ref rawLeft, ref rawRight, ref rawTop, ref rawBottom);
+
+                var near = eyeCamera.nearClipPlane;
+                var far = eyeCamera.farClipPlane;
+
+                // Sorted into Unity's y-up convention, exactly as the crop path does.
+                var frustumLeft = Mathf.Min(rawLeft, rawRight) * near;
+                var frustumRight = Mathf.Max(rawLeft, rawRight) * near;
+                // NOT negated. OpenVR's pfTop/pfBottom are already signed offsets in the
+                // same sense Unity wants - pfTop comes back negative and pfBottom positive,
+                // so they only need sorting. Negating them flipped the frustum vertically:
+                // we were rendering ~1.43 up / 0.97 down where the headset actually wants
+                // 0.97 up / 1.43 down. Cross-checked against GetProjectionMatrix, whose
+                // m11/m12 imply top=+0.966, bottom=-1.428 for this eye.
+                var frustumBottom = Mathf.Min(rawTop, rawBottom) * near;
+                var frustumTop = Mathf.Max(rawTop, rawBottom) * near;
+
+                var projection = Matrix4x4.Frustum(
+                    frustumLeft, frustumRight, frustumBottom, frustumTop, near, far);
+
+                eyeCamera.projectionMatrix = projection;
+                eyeCamera.nonJitteredProjectionMatrix = projection;
+
+                // With the off-centre matrix the camera was not merely drawing an empty
+                // frame - it was not being rendered AT ALL (its end-of-render callback never
+                // fired). That is what LightweightRP does when Camera.TryGetCullingParameters
+                // fails: "if (!camera.TryGetCullingParameters(...)) return;", silently.
+                //
+                // So give it a culling frustum it will accept: a WIDE but ordinary
+                // perspective frustum that comfortably contains the real one. The previous
+                // attempt used Matrix4x4.Ortho with +/-99999 extents, which is extreme enough
+                // to fail that same validation - fixing nothing.
+                eyeCamera.cullingMatrix = Matrix4x4.Perspective(
+                    150f, 1f, eyeCamera.nearClipPlane, eyeCamera.farClipPlane)
+                    * eyeCamera.worldToCameraMatrix;
+                eyeCamera.useOcclusionCulling = false;
+
+                // The eye frustum IS the rendered frustum, so no cropping - and reset it, in
+                // case we've just toggled back from the symmetric fallback.
+                var fullBounds = FullTextureBounds;
+                var fullCrop = new Rect(0f, 0f, 1f, 1f);
+                if (eye == EVREye.Eye_Left)
+                {
+                    _leftBounds = fullBounds;
+                    _leftCrop = fullCrop;
+                }
+                else
+                {
+                    _rightBounds = fullBounds;
+                    _rightCrop = fullCrop;
+                }
+
+                return;
+            }
+
+            if (!_matchHmdFieldOfView)
+            {
+                // Render at the game's own narrow field of view, with no widening and no
+                // crop. The picture will look magnified - that is expected and not the
+                // point. The question is whether the distortion SURVIVES at 45 degrees: if
+                // it disappears, rendering this game's scenes at ~110 degrees is what
+                // produces it; if it persists, the field of view is innocent and the fault
+                // is elsewhere entirely.
+                // Match the game camera's projection EXACTLY - field of view AND aspect. The
+                // earlier version of this test matched only the FOV and took aspect from the
+                // texture, so the projections still differed. That matters if the game's
+                // renderer feeds screen-space effects from the main camera's matrices: our
+                // cameras would then be shading with values computed for a different
+                // projection, giving a warp that varies with view angle and survives any
+                // FOV change.
+                eyeCamera.ResetProjectionMatrix();
+                if (_gameMainCamera != null)
+                {
+                    eyeCamera.fieldOfView = _gameMainCamera.fieldOfView;
+                    eyeCamera.aspect = _gameMainCamera.aspect;
+                }
+
+                var fullCropOnly = new Rect(0f, 0f, 1f, 1f);
+                if (eye == EVREye.Eye_Left)
+                    _leftCrop = fullCropOnly;
+                else
+                    _rightCrop = fullCropOnly;
+
+                return;
+            }
+
+            ApplySymmetricEyeFrustum(eyeCamera, eye);
         }
 
         /// <summary>Zeroes the yaw of the current HMD orientation as the new forward.</summary>
@@ -244,12 +493,12 @@ namespace NirvanaVR
             // already snapshotted it by the time this fires.
             if (camera == _leftEyeCamera)
             {
-                camera.projectionMatrix = _leftEyeProjection;
+                ApplyEyeCameraProjection(camera, EVREye.Eye_Left);
                 return;
             }
 
             if (camera == _rightEyeCamera)
-                camera.projectionMatrix = _rightEyeProjection;
+                ApplyEyeCameraProjection(camera, EVREye.Eye_Right);
         }
 
         /// <summary>
@@ -285,47 +534,261 @@ namespace NirvanaVR
             var hmdRot = GetRecenteredRotation();
             var hmdPos = GetRecenteredPosition();
 
-            var correctedRot = baseRot * hmdRot;
-            var correctedPos = basePos + baseRot * hmdPos;
+            // Compose the head pose against the game camera's YAW only, discarding its pitch
+            // and roll. This game frames its shots cinematically - tilted, pitched cameras -
+            // and composing inside that tilted frame means turning your head rotates the
+            // world about a tilted axis, so the horizon skews and the error grows the
+            // further you look from centre. That is static, depends on head angle, and shows
+            // up in every mode including the plain mirror, which is exactly what we see. It
+            // is also invisible on a flat monitor, which is why it passed in Phase 1.
+            // Levelling the base lets the headset define up, as it must in VR.
+            var effectiveBaseRot = _levelHorizon
+                ? Quaternion.Euler(0f, baseRot.eulerAngles.y, 0f)
+                : baseRot;
+
+            var correctedRot = effectiveBaseRot * hmdRot;
+            var correctedPos = basePos + effectiveBaseRot * hmdPos;
+
+            // The game camera now only ever carries the head pose, plus an optional
+            // pullback along its OWN view axis (using the head rotation here would make the
+            // offset a lever arm and swing the viewpoint around the room when you turn).
+            // Per-eye offsets and frustums live on the two dedicated eye cameras, which
+            // render the scene themselves - so nothing here disturbs the game's rendering.
+            if (!_mirrorGameFrameToEyes && _cameraPullback != 0f)
+                correctedPos += baseRot * new Vector3(0f, 0f, -_cameraPullback);
 
             t.SetPositionAndRotation(correctedPos, correctedRot);
 
+            // Store what we actually wrote (eye offset included) so next frame's guard
+            // still recognises our own output and doesn't compound the offset.
             _lastAppliedPos = correctedPos;
             _lastAppliedRot = correctedRot;
             _haveLastApplied = true;
         }
 
-        // Textures whose render commands were recorded this frame and are waiting to be
-        // handed to the compositor - see the comment on OnEndCameraRendering below.
-        private static RenderTexture _pendingLeftSubmit;
-        private static RenderTexture _pendingRightSubmit;
-
         /// <summary>
-        /// RenderPipelineManager.endCameraRendering handler. Fires once a camera's draw
-        /// commands are recorded into the ScriptableRenderContext - but URP doesn't
-        /// actually flush those commands to the GPU (context.Submit()) until after the
-        /// whole camera batch finishes, which happens AFTER this callback returns. Handing
-        /// a texture to OpenVR's (cross-process) Compositor.Submit() here, before the GPU
-        /// has actually rendered into it, appears to race with SteamVR's compositor and
-        /// intermittently wedge it. So we only record which texture is ready here, and
-        /// actually submit it at the start of the NEXT frame (PumpPoses), once a full
-        /// frame boundary - and therefore the GPU flush - has definitely passed.
+        /// RenderPipelineManager.endCameraRendering handler. In stereo mode the game's own
+        /// camera has just drawn this frame from one eye's viewpoint, so copy that result
+        /// into the matching eye's submit texture. The copy also converts the game's HDR
+        /// render target into the 8-bit sRGB surface the compositor will accept.
+        ///
+        /// Nothing is submitted from here: this fires while the pipeline is still recording
+        /// commands, and handing a texture to OpenVR before the GPU has actually run them
+        /// raced the compositor badly enough to hang the game. Submission happens a frame
+        /// later, from PumpPoses.
         /// </summary>
         public static void OnEndCameraRendering(ScriptableRenderContext context, Camera camera)
         {
-            // Read the texture off the camera itself rather than indexing by _bufferIndex:
-            // this is by definition the target that was just rendered, so the thing we
-            // submit can never drift out of sync with the thing that was drawn.
+            // Nothing is copied or submitted from here. Graphics.Blit runs immediately and
+            // doesn't mix with an SRP that is still recording this frame's commands - doing
+            // the eye copy here produced flat grey, the same way submitting from here used
+            // to hang the compositor. Both happen from LateUpdate instead.
             if (camera == _leftEyeCamera)
-            {
                 _leftRenderCount++;
-                _pendingLeftSubmit = camera.targetTexture;
-            }
-            else if (camera == _rightEyeCamera)
+
+            // Pure maths, no GPU work, so it's safe here - and here is the only place the
+            // projection the camera ACTUALLY rendered with is guaranteed current.
+            if (_mirrorGameFrameToEyes || !_stereoRigCreated)
+                return;
+
+            // Match Pathologic 2's timing exactly: copy and submit each eye the moment that
+            // eye finishes rendering, in the same frame, rather than both together a frame
+            // later from LateUpdate. That is now the only structural difference left between
+            // the two mods - P2 renders correct geometry and displays correctly on this
+            // machine, ours renders correct geometry and displays distorted.
+            if (_submitImmediately)
             {
-                _pendingRightSubmit = camera.targetTexture;
+                if (camera == _leftEyeCamera)
+                    CopyAndSubmitEye(EVREye.Eye_Left, _leftEyeTexture, _leftSubmitTexture, _leftCrop);
+                else if (camera == _rightEyeCamera)
+                    CopyAndSubmitEye(EVREye.Eye_Right, _rightEyeTexture, _rightSubmitTexture, _rightCrop);
+            }
+
+            if (_useAsymmetricEyeProjection)
+            {
+                // No crop needed in this mode, but verify the claim it rests on: that the
+                // frustum the camera ACTUALLY rendered matches the headset's. If these two
+                // agree and the image still looks wrong, the fault is not in our rendering.
+                if (camera == _leftEyeCamera)
+                    VerifyRenderedFrustum(camera, EVREye.Eye_Left);
+                return;
+            }
+
+            // Only needed for the symmetric+crop fallback; with the true asymmetric frustum
+            // the whole texture is the eye view.
+            if (camera == _leftEyeCamera)
+                UpdateEyeBoundsFromRenderedProjection(camera, EVREye.Eye_Left);
+            else if (camera == _rightEyeCamera)
+                UpdateEyeBoundsFromRenderedProjection(camera, EVREye.Eye_Right);
+        }
+
+        /// <summary>
+        /// Works out which part of the just-rendered image corresponds to this eye's true
+        /// frustum, by reading back the projection the camera actually used.
+        ///
+        /// Deriving this from the fieldOfView/aspect we requested is not reliable: Unity
+        /// snapshots camera state at its own moment and Cinemachine drives fieldOfView from
+        /// its LateUpdate, so the values that reach the renderer may not be ours. A crop
+        /// that doesn't match the render is exactly what makes the world appear magnified
+        /// and warp like a fishbowl when the head moves, because the compositor then
+        /// stretches the image non-uniformly across the lens.
+        ///
+        /// For a standard projection matrix, the frustum's tangent extents come straight
+        /// out of it: with a = m00 and c = m02, the horizontal tangents are (c+1)/a and
+        /// (c-1)/a; likewise vertically from m11 and m12.
+        /// </summary>
+        /// <summary>
+        /// Compares the frustum the camera actually rendered against the headset's own, both
+        /// as tangents. If they match, the submitted image is geometrically what OpenVR
+        /// expects and nothing in our rendering can be causing the distortion.
+        /// </summary>
+        private static void VerifyRenderedFrustum(Camera camera, EVREye eye)
+        {
+            if (_verifyLogCount++ % 150 != 0)
+                return;
+
+            var projection = camera.projectionMatrix;
+            var a = projection.m00;
+            var b = projection.m11;
+            if (Mathf.Abs(a) < 1e-6f || Mathf.Abs(b) < 1e-6f)
+                return;
+
+            var renderedLeft = Mathf.Min((projection.m02 + 1f) / a, (projection.m02 - 1f) / a);
+            var renderedRight = Mathf.Max((projection.m02 + 1f) / a, (projection.m02 - 1f) / a);
+            var renderedBottom = Mathf.Min((projection.m12 + 1f) / b, (projection.m12 - 1f) / b);
+            var renderedTop = Mathf.Max((projection.m12 + 1f) / b, (projection.m12 - 1f) / b);
+
+            // Derive the reference from GetProjectionMatrix - the call Pathologic 2 uses -
+            // rather than from our own reading of GetProjectionRaw. Checking our frustum
+            // against our own interpretation of the raw values is what let a vertical sign
+            // error report a perfect match: both sides shared the same mistake.
+            var reference = ToUnityMatrix(_system.GetProjectionMatrix(
+                eye, camera.nearClipPlane, camera.farClipPlane));
+            var ra = reference.m00;
+            var rb = reference.m11;
+            if (Mathf.Abs(ra) < 1e-6f || Mathf.Abs(rb) < 1e-6f)
+                return;
+
+            var eyeLeft = Mathf.Min((reference.m02 + 1f) / ra, (reference.m02 - 1f) / ra);
+            var eyeRight = Mathf.Max((reference.m02 + 1f) / ra, (reference.m02 - 1f) / ra);
+            var eyeBottom = Mathf.Min((reference.m12 + 1f) / rb, (reference.m12 - 1f) / rb);
+            var eyeTop = Mathf.Max((reference.m12 + 1f) / rb, (reference.m12 - 1f) / rb);
+
+            var worstError = Mathf.Max(
+                Mathf.Max(Mathf.Abs(renderedLeft - eyeLeft), Mathf.Abs(renderedRight - eyeRight)),
+                Mathf.Max(Mathf.Abs(renderedBottom - eyeBottom), Mathf.Abs(renderedTop - eyeTop)));
+
+            MelonLogger.Msg($"NirvanaVR: verify rendered x[{renderedLeft:F3},{renderedRight:F3}] y[{renderedBottom:F3},{renderedTop:F3}] " +
+                $"| headset x[{eyeLeft:F3},{eyeRight:F3}] y[{eyeBottom:F3},{eyeTop:F3}] " +
+                $"| worst error {worstError:F4} -> {(worstError < 0.01f ? "MATCH (our render is correct)" : "MISMATCH (this is the distortion)")} " +
+                $"| target {(camera.targetTexture != null ? camera.targetTexture.width + "x" + camera.targetTexture.height : "none")}");
+        }
+
+        private static long _verifyLogCount;
+
+        private static void UpdateEyeBoundsFromRenderedProjection(Camera camera, EVREye eye)
+        {
+            var projection = camera.projectionMatrix;
+            var a = projection.m00;
+            var b = projection.m11;
+            if (Mathf.Abs(a) < 1e-6f || Mathf.Abs(b) < 1e-6f)
+                return;
+
+            // Sort rather than assume an ordering. Unity can hand back a matrix with a
+            // negative m11 (it flips Y when rendering into a texture on D3D), which silently
+            // inverts these extents - and an inverted crop rotates the submitted image 180
+            // degrees, which reads as head tracking running backwards on both axes.
+            var renderedLeft = Mathf.Min((projection.m02 + 1f) / a, (projection.m02 - 1f) / a);
+            var renderedRight = Mathf.Max((projection.m02 + 1f) / a, (projection.m02 - 1f) / a);
+            var renderedBottom = Mathf.Min((projection.m12 + 1f) / b, (projection.m12 - 1f) / b);
+            var renderedTop = Mathf.Max((projection.m12 + 1f) / b, (projection.m12 - 1f) / b);
+
+            var width = renderedRight - renderedLeft;
+            var height = renderedTop - renderedBottom;
+            if (width < 1e-6f || height < 1e-6f)
+                return;
+
+            float rawLeft = 0f, rawRight = 0f, rawTop = 0f, rawBottom = 0f;
+            _system.GetProjectionRaw(eye, ref rawLeft, ref rawRight, ref rawTop, ref rawBottom);
+
+            // Sorted, NOT negated - see the frustum construction for why.
+            var eyeLeft = Mathf.Min(rawLeft, rawRight);
+            var eyeRight = Mathf.Max(rawLeft, rawRight);
+            var eyeBottom = Mathf.Min(rawTop, rawBottom);
+            var eyeTop = Mathf.Max(rawTop, rawBottom);
+
+            // Calibration (F1/F2). Every step of this geometry checks out on paper, yet the
+            // image is still distorted in a way that scales with viewing angle - the
+            // signature of the rendered field of view not matching the displayed one. This
+            // scales the crop about its centre, so if some factor makes the distortion
+            // vanish, that factor IS the mismatch and tells us what the real ratio should be.
+            if (Mathf.Abs(_fovCalibration - 1f) > 1e-4f)
+            {
+                var centreX = (eyeLeft + eyeRight) * 0.5f;
+                var centreY = (eyeBottom + eyeTop) * 0.5f;
+                eyeLeft = centreX + (eyeLeft - centreX) * _fovCalibration;
+                eyeRight = centreX + (eyeRight - centreX) * _fovCalibration;
+                eyeBottom = centreY + (eyeBottom - centreY) * _fovCalibration;
+                eyeTop = centreY + (eyeTop - centreY) * _fovCalibration;
+            }
+
+            var uLeft = Mathf.Clamp01((eyeLeft - renderedLeft) / width);
+            var uRight = Mathf.Clamp01((eyeRight - renderedLeft) / width);
+            var vBottom = Mathf.Clamp01((eyeBottom - renderedBottom) / height);
+            var vTop = Mathf.Clamp01((eyeTop - renderedBottom) / height);
+
+            // u ascending; v descending, which is the vertical flip a Unity RenderTexture
+            // needs on D3D11 - the same orientation the full-frame bounds used.
+            // Store the crop as a plain UV rectangle. We apply it ourselves when copying into
+            // the submit texture rather than passing it to the compositor as texture bounds:
+            // the distortion is static and scales with viewing angle, which is what you get
+            // when the full symmetric render is stretched onto the narrower eye frustum -
+            // i.e. exactly as if the bounds were being ignored. Doing the crop in our own
+            // blit removes the dependency on how the compositor interprets them.
+            var crop = new Rect(uLeft, Mathf.Min(vTop, vBottom), uRight - uLeft, Mathf.Abs(vTop - vBottom));
+
+            if (eye == EVREye.Eye_Left)
+                _leftCrop = crop;
+            else
+                _rightCrop = crop;
+
+            var bounds = new VRTextureBounds_t
+            {
+                uMin = uLeft,
+                uMax = uRight,
+                vMin = vTop,
+                vMax = vBottom
+            };
+
+            if (eye == EVREye.Eye_Left)
+                _leftBounds = bounds;
+            else
+                _rightBounds = bounds;
+
+            // TEMP DIAGNOSTIC, ~every 5s: is the camera actually rendering at the headset's
+            // field of view, and does the eye's frustum fit inside what was rendered? If the
+            // render is still the game's ~45 degrees, the eye extents overflow it, the crop
+            // clamps to the whole image for both eyes, and nothing can fuse.
+            if (eye == EVREye.Eye_Left && _boundsLogCount++ % 150 == 0)
+            {
+                // State of every toggle, so the log says exactly which configuration
+                // produced a given result instead of us tracking key presses by memory.
+                MelonLogger.Msg($"NirvanaVR: config mode={(_mirrorGameFrameToEyes ? "MIRROR" : "STEREO")} " +
+                    $"frustum={(_useAsymmetricEyeProjection ? "asymmetric" : "symmetric+crop")} " +
+                    $"fov={(_matchHmdFieldOfView ? "headset" : "game")} horizon={(_levelHorizon ? "level" : "game")} " +
+                    $"ipd={_ipdScale:F2} pullback={_cameraPullback:F2} fovCal={_fovCalibration:F2}");
+
+                // Print BOTH eyes: sampling one every N calls always lands on the same eye,
+                // which would hide the right eye silently keeping default full-texture
+                // bounds - a left/right mismatch that would itself look like distortion.
+                MelonLogger.Msg($"NirvanaVR: bounds L u[{_leftBounds.uMin:F3},{_leftBounds.uMax:F3}] v[{_leftBounds.vMin:F3},{_leftBounds.vMax:F3}] " +
+                    $"| R u[{_rightBounds.uMin:F3},{_rightBounds.uMax:F3}] v[{_rightBounds.vMin:F3},{_rightBounds.vMax:F3}] " +
+                    $"| rendered x[{renderedLeft:F3},{renderedRight:F3}] y[{renderedBottom:F3},{renderedTop:F3}] " +
+                    $"| eyeL x[{eyeLeft:F3},{eyeRight:F3}] y[{eyeBottom:F3},{eyeTop:F3}]");
             }
         }
+
+        private static long _boundsLogCount;
 
         // TEMP DIAGNOSTIC: how many times the SRP has actually run the left eye camera.
         // If this climbs while the probed texture stays bit-identical, the camera is being
@@ -337,13 +800,172 @@ namespace NirvanaVR
         // so we can see on the monitor whether it produces a live image or a frozen one.
         private static bool _mirrorLeftEyeToScreen;
 
+        /// <summary>
+        /// The cloned eye cameras stay disabled in every mode. Neither path uses them any
+        /// more - mirror mode blits the game's finished frame, stereo mode re-renders the
+        /// game's own camera - and leaving them enabled actively broke stereo: they'd
+        /// render and OnEndCameraRendering would overwrite the pending submit textures with
+        /// their HDR render targets, which the compositor rejects with
+        /// TextureUsesUnsupportedFormat. They're kept purely as the scene-change sentinel
+        /// that IsEyeRigAttachedTo watches.
+        /// </summary>
         private static void ApplyEyeCameraEnabledForMode()
         {
             if (_leftEyeCamera == null || _rightEyeCamera == null)
                 return;
 
+            // Enabled in stereo mode: these are what actually render the two eye views now,
+            // both within the same frame - which is what removes the temporal mismatch that
+            // made the alternating single-camera approach double up during head movement.
             _leftEyeCamera.enabled = !_mirrorGameFrameToEyes;
             _rightEyeCamera.enabled = !_mirrorGameFrameToEyes;
+        }
+
+        /// <summary>
+        /// Applies the HMD's per-eye frustum to the game camera, from LateUpdate - i.e.
+        /// before the pipeline runs, so the culling matrix set here is actually the one
+        /// used to cull this frame.
+        ///
+        /// The off-centre frustum is the whole difficulty: an explicit but SYMMETRIC matrix
+        /// renders fine (the F7 control test), while the HMD's asymmetric one renders
+        /// nothing but background, because Unity culls the scene against it. So we pair the
+        /// real projection with a deliberately enormous culling frustum: the projection
+        /// decides what's drawn, the culling matrix ensures nothing is thrown away first.
+        ///
+        /// _currentEye has already been flipped by CaptureRenderedEye at this point, so it
+        /// refers to the eye the upcoming render is for.
+        /// </summary>
+        private static void ApplyEyeProjection()
+        {
+            if (_mirrorGameFrameToEyes || !_stereoRigCreated || _gameMainCamera == null)
+                return;
+
+            var camera = _gameMainCamera;
+
+            if (_matchHmdFieldOfView)
+                ApplySymmetricEyeFrustum(camera, _currentEye);
+
+            if (!_applyEyeProjection)
+                return;
+
+            // Built from the camera's CURRENT clip planes: shaders derive _ZBufferParams
+            // from nearClipPlane/farClipPlane, so a matrix encoding different planes than
+            // the camera advertises makes depth-based effects reconstruct nonsense.
+            var projection = ToUnityMatrix(_system.GetProjectionMatrix(
+                _currentEye, camera.nearClipPlane, camera.farClipPlane));
+
+            camera.projectionMatrix = projection;
+            camera.nonJitteredProjectionMatrix = projection;
+            camera.cullingMatrix = Matrix4x4.Ortho(-99999f, 99999f, -99999f, 99999f, 0.001f, 99999f)
+                * camera.worldToCameraMatrix;
+            camera.useOcclusionCulling = false;
+        }
+
+        /// <summary>
+        /// Gives the camera a SYMMETRIC frustum wide enough to contain this eye's real
+        /// (off-centre) frustum, and works out which sub-rectangle of the resulting image
+        /// the eye actually occupies. Uses fieldOfView/aspect, so Unity keeps its implicit
+        /// projection - no explicit matrix, which is what breaks this game's rendering.
+        ///
+        /// OpenVR's raw values are tangents of the half-angles, with y measured downwards,
+        /// so top comes out negative and bottom positive; negating them puts us in Unity's
+        /// y-up convention.
+        /// </summary>
+        private static void ApplySymmetricEyeFrustum(Camera camera, EVREye eye)
+        {
+            float rawLeft = 0f, rawRight = 0f, rawTop = 0f, rawBottom = 0f;
+            _system.GetProjectionRaw(eye, ref rawLeft, ref rawRight, ref rawTop, ref rawBottom);
+
+            var xMin = rawLeft;
+            var xMax = rawRight;
+            var yMin = -rawBottom;
+            var yMax = -rawTop;
+
+            var tanX = Mathf.Max(Mathf.Abs(xMin), Mathf.Abs(xMax));
+            var tanY = Mathf.Max(Mathf.Abs(yMin), Mathf.Abs(yMax));
+            if (tanX <= 0f || tanY <= 0f)
+                return;
+
+            if (!_haveOriginalFieldOfView)
+            {
+                _originalFieldOfView = camera.fieldOfView;
+                _haveOriginalFieldOfView = true;
+            }
+
+            // Small margin so the eye's frustum sits just inside what we render. The old
+            // 1.35 was compensating for the game camera rendering ~0.84x the frustum it was
+            // asked for; our own cameras honour the explicit matrix exactly (requested tanY
+            // 1.928 came back as 1.928), so the padding is no longer needed - and shrinking
+            // it hands a much larger share of the texture's pixels to the visible region.
+            tanX *= 1.08f;
+            tanY *= 1.08f;
+
+            var fovY = 2f * Mathf.Atan(tanY) * Mathf.Rad2Deg;
+            var aspect = tanX / tanY;
+
+            camera.fieldOfView = fovY;
+            camera.aspect = aspect;
+
+            // Set the matrix explicitly rather than trusting fieldOfView/aspect to produce
+            // it. They don't: the camera reported fov=110 while actually rendering ~100
+            // (gate fit reinterprets the vertical FOV once aspect is overridden), so the
+            // eye's frustum overflowed the rendered one and the crop clamped on both axes -
+            // which is what kept the images from fusing. A SYMMETRIC explicit matrix renders
+            // correctly here (that was the F7 control test); only off-centre ones fail.
+            var projection = Matrix4x4.Perspective(fovY, aspect, camera.nearClipPlane, camera.farClipPlane);
+            camera.projectionMatrix = projection;
+            camera.nonJitteredProjectionMatrix = projection;
+
+            // The crop rectangle is NOT computed here - it's derived after the render, from
+            // the projection the camera actually used (see
+            // UpdateEyeBoundsFromRenderedProjection), because the values we set here may not
+            // be the ones that reach the renderer.
+        }
+
+        /// <summary>
+        /// F1/F2: scale how far HMD movement carries in the game world. 1.0 assumes the game
+        /// is built at 1 unit = 1 metre; if it isn't, head movement produces the wrong
+        /// parallax and the world appears to swell and shrink as you turn.
+        /// </summary>
+        public static void AdjustHeadTranslationScale(float delta)
+        {
+            _headTranslationScale = Mathf.Clamp(_headTranslationScale + delta, 0f, 8f);
+            MelonLogger.Msg($"NirvanaVR: head translation scale {_headTranslationScale:F2}x " +
+                "(0 = rotation only, no positional tracking at all)");
+        }
+
+        /// <summary>F3/F4: move the viewpoint back from / closer to the scene.</summary>
+        public static void AdjustCameraPullback(float delta)
+        {
+            _cameraPullback = Mathf.Clamp(_cameraPullback + delta, -2f, 20f);
+            MelonLogger.Msg($"NirvanaVR: camera pullback {_cameraPullback:F2}m");
+        }
+
+        /// <summary>F5/F6: weaken or strengthen the stereo depth.</summary>
+        public static void AdjustIpdScale(float delta)
+        {
+            _ipdScale = Mathf.Clamp(_ipdScale + delta, 0.1f, 6f);
+            MelonLogger.Msg($"NirvanaVR: IPD scale {_ipdScale:F2}x");
+        }
+
+        /// <summary>
+        /// F7: render at the headset's wide field of view (with crop) versus the game's own
+        /// narrow one (no crop). Isolates whether wide-FOV rendering causes the distortion.
+        /// </summary>
+        public static void ToggleUnityPerspectiveTest()
+        {
+            _matchHmdFieldOfView = !_matchHmdFieldOfView;
+            MelonLogger.Msg($"NirvanaVR: field of view = {(_matchHmdFieldOfView ? "HEADSET (~110 deg, cropped to the eye frustum)" : "GAME (~45 deg, uncropped - will look magnified)")}");
+        }
+
+        /// <summary>
+        /// F8: toggle the per-eye projection override, so it can be tested without a
+        /// rebuild. Expect grey while it's on until the matrix problem is solved.
+        /// </summary>
+        public static void ToggleEyeProjection()
+        {
+            _submitImmediately = !_submitImmediately;
+            MelonLogger.Msg($"NirvanaVR: submit timing = {(_submitImmediately ? "IMMEDIATE (same frame, in the render callback - Pathologic 2's timing)" : "DEFERRED (both eyes next frame from LateUpdate)")}");
         }
 
         /// <summary>
@@ -354,7 +976,18 @@ namespace NirvanaVR
         {
             _mirrorGameFrameToEyes = !_mirrorGameFrameToEyes;
             ApplyEyeCameraEnabledForMode();
-            MelonLogger.Msg($"NirvanaVR: {(_mirrorGameFrameToEyes ? "MIRROR mode - copying the game's own frame to both eyes (mono)" : "STEREO mode - per-eye cameras rendering the scene")}");
+
+            // Returning to mirror mode hands the game's camera back its own projection and
+            // culling - in stereo mode we overwrite both each frame.
+            if (_mirrorGameFrameToEyes && _gameMainCamera != null)
+            {
+                _gameMainCamera.ResetProjectionMatrix();
+                _gameMainCamera.ResetCullingMatrix();
+
+                if (_haveOriginalFieldOfView)
+                    _gameMainCamera.fieldOfView = _originalFieldOfView;
+            }
+            MelonLogger.Msg($"NirvanaVR: {(_mirrorGameFrameToEyes ? "MIRROR mode - copying the game's own frame to both eyes (mono)" : "STEREO mode - re-rendering the game's own camera once per eye")}");
         }
 
         /// <summary>
@@ -365,16 +998,25 @@ namespace NirvanaVR
         {
             UseScreenSizedEyeTextures = !UseScreenSizedEyeTextures;
 
-            _pendingLeftSubmit = null;
-            _pendingRightSubmit = null;
             DestroyEyeCamera(ref _leftEyeCamera);
             DestroyEyeCamera(ref _rightEyeCamera);
             ReleaseEyeTexture(ref _leftEyeTexture);
             ReleaseEyeTexture(ref _rightEyeTexture);
+            ReleaseEyeTexture(ref _leftSubmitTexture);
+            ReleaseEyeTexture(ref _rightSubmitTexture);
             _stereoRigCreated = false;
             _rebuildCooldownRemaining = -1;
 
             MelonLogger.Msg($"NirvanaVR: eye texture size -> {(UseScreenSizedEyeTextures ? "screen size" : "HMD recommended size")}, rebuilding rig");
+        }
+
+        /// <summary>F10: level the horizon (yaw-only base) versus the game camera's full
+        /// rotation, so the two can be compared directly.</summary>
+        public static void ToggleLevelHorizon()
+        {
+            _levelHorizon = !_levelHorizon;
+            _haveLastApplied = false; // the guard's cached pose is from the other convention
+            MelonLogger.Msg($"NirvanaVR: horizon {(_levelHorizon ? "LEVEL (yaw-only base - headset defines up)" : "FOLLOWS GAME CAMERA (inherits its pitch and roll)")}");
         }
 
         public static void ToggleLeftEyeScreenMirror()
@@ -443,14 +1085,14 @@ namespace NirvanaVR
                 MelonLogger.Msg("NirvanaVR: rebuilding stereo rig after cooldown");
                 // Drop any not-yet-submitted textures from the old rig before releasing
                 // them, so PumpPoses doesn't try to submit a destroyed RenderTexture.
-                _pendingLeftSubmit = null;
-                _pendingRightSubmit = null;
                 // Tear down any eye cameras that are still alive (the stale-parent case) so
                 // we don't leave orphans rendering into textures we're about to release.
                 DestroyEyeCamera(ref _leftEyeCamera);
                 DestroyEyeCamera(ref _rightEyeCamera);
                 ReleaseEyeTexture(ref _leftEyeTexture);
                 ReleaseEyeTexture(ref _rightEyeTexture);
+                ReleaseEyeTexture(ref _leftSubmitTexture);
+                ReleaseEyeTexture(ref _rightSubmitTexture);
                 _stereoRigCreated = false;
                 _rebuildCooldownRemaining = -1;
             }
@@ -475,8 +1117,10 @@ namespace NirvanaVR
                 height = (uint)Screen.height;
             }
 
-            _leftEyeTexture = CreateEyeTexture(width, height, "NirvanaVR_LeftEyeRT");
-            _rightEyeTexture = CreateEyeTexture(width, height, "NirvanaVR_RightEyeRT");
+            _leftEyeTexture = CreateEyeTexture(width, height, "NirvanaVR_LeftEyeRT", mainCamera);
+            _rightEyeTexture = CreateEyeTexture(width, height, "NirvanaVR_RightEyeRT", mainCamera);
+            _leftSubmitTexture = CreateSubmitTexture(width, height, "NirvanaVR_LeftSubmitRT");
+            _rightSubmitTexture = CreateSubmitTexture(width, height, "NirvanaVR_RightSubmitRT");
 
             _leftEyeProjection = ToUnityMatrix(
                 _system.GetProjectionMatrix(EVREye.Eye_Left, mainCamera.nearClipPlane, mainCamera.farClipPlane));
@@ -498,11 +1142,57 @@ namespace NirvanaVR
                 $"left eye target='{_leftEyeCamera.targetTexture?.name}'");
         }
 
-        private static RenderTexture CreateEyeTexture(uint width, uint height, string name)
+        private static RenderTexture CreateEyeTexture(uint width, uint height, string name, Camera gameCamera)
         {
-            // Explicit sRGB to pair with the EColorSpace.Gamma we submit - leaving either
-            // side implicit invites a gamma mismatch that crushes mid-tones.
-            var rt = new RenderTexture((int)width, (int)height, 24,
+            // Clone the descriptor of the RenderTexture the game itself renders into, only
+            // changing the size. A camera rendering into our own hand-rolled descriptor
+            // produced flat grey in-game - even the game's own camera did - while blitting
+            // into it worked fine, so the texture, not the camera, was the problem. The
+            // game's target is linear (sRGB=False); a Linear-colour-space LightweightRP
+            // expects that of a camera target. Rather than guess which of the descriptor
+            // fields matters, copy the one that demonstrably works.
+            var template = gameCamera != null ? gameCamera.targetTexture : null;
+
+            RenderTexture rt;
+            if (template != null)
+            {
+                var descriptor = template.descriptor;
+                descriptor.width = (int)width;
+                descriptor.height = (int)height;
+
+                // A scene render needs somewhere to put depth even if the game's own target
+                // doesn't carry it.
+                if (descriptor.depthBufferBits < 24)
+                    descriptor.depthBufferBits = 24;
+
+                rt = new RenderTexture(descriptor) { name = name };
+                MelonLogger.Msg($"NirvanaVR: eye RT '{name}' {width}x{height} cloned from game target - " +
+                    $"format={descriptor.colorFormat} sRGB={descriptor.sRGB} depth={descriptor.depthBufferBits} " +
+                    $"msaa={descriptor.msaaSamples} dynamicScale={descriptor.useDynamicScale}");
+            }
+            else
+            {
+                // Menus render straight to the screen, so there's no descriptor to copy yet.
+                // The rig gets rebuilt on the next scene change and picks one up then.
+                rt = new RenderTexture((int)width, (int)height, 24,
+                    RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB) { name = name };
+                MelonLogger.Msg($"NirvanaVR: eye RT '{name}' {width}x{height} using fallback descriptor (game camera renders to screen)");
+            }
+
+            rt.useMipMap = false;
+            rt.autoGenerateMips = false;
+            rt.Create();
+            return rt;
+        }
+
+        /// <summary>
+        /// The surface actually handed to the compositor: plain 8-bit sRGB, no depth, no
+        /// MSAA. Nothing renders into this directly - we blit the eye's render target into
+        /// it - so it only has to satisfy OpenVR, not the render pipeline.
+        /// </summary>
+        private static RenderTexture CreateSubmitTexture(uint width, uint height, string name)
+        {
+            var rt = new RenderTexture((int)width, (int)height, 0,
                 RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB)
             {
                 name = name,
@@ -606,13 +1296,14 @@ namespace NirvanaVR
 
             cam.projectionMatrix = projection;
 
-            // Clear opaque: Main Camera clears to transparent black (alpha 0) and CopyFrom
-            // inherits that. The game composites its own frame later so the alpha never
-            // matters there, but we hand this texture straight to the compositor.
-            // TEMP: blue rather than black, so "solid colour" (nothing drawn) is instantly
-            // distinguishable from "black scene".
-            cam.clearFlags = CameraClearFlags.SolidColor;
-            cam.backgroundColor = new Color(0f, 0f, 1f, 1f);
+            // Clear the same way the game's own camera does, so backgrounds (skybox and the
+            // like) appear instead of a flat fill - that flat fill was the blue back wall.
+            // Force the alpha opaque regardless: the game clears to transparent black
+            // because it composites its frame later, but we hand this straight to the
+            // compositor.
+            cam.clearFlags = mainCamera.clearFlags;
+            var background = mainCamera.backgroundColor;
+            cam.backgroundColor = new Color(background.r, background.g, background.b, 1f);
 
             return cam;
         }
@@ -632,6 +1323,14 @@ namespace NirvanaVR
             // Once every ~5s - ReadPixels stalls the pipeline, so keep it rare.
             if (_probeCount++ % 300 != 0)
                 return;
+
+            // Whether the eye cameras are even being rendered. If leftRenders stops climbing
+            // while this says enabled=True, the pipeline is skipping them - which is exactly
+            // what an unusable projection matrix causes, and it looks identical to "the
+            // scene rendered grey".
+            MelonLogger.Msg($"NirvanaVR: eye cams enabled L={(_leftEyeCamera != null && _leftEyeCamera.enabled)} " +
+                $"R={(_rightEyeCamera != null && _rightEyeCamera.enabled)} " +
+                $"frustum={(_useAsymmetricEyeProjection ? "asymmetric" : "symmetric+crop")} leftRenders={_leftRenderCount}");
 
             // Sample our eye texture AND the game's own Main Camera render target at the
             // same moment. If the game's target is just as dark, our render matches the
@@ -686,14 +1385,19 @@ namespace NirvanaVR
 
             // Game runs on the D3D11 backend (confirmed via SystemInfo.graphicsDeviceType) -
             // revisit ETextureType if that ever changes.
-            // Gamma (not Auto) to match the sRGB RenderTexture we render into.
+            // Derive the colour space from the texture instead of hardcoding it: an sRGB
+            // texture stores gamma-encoded bytes, a linear one stores linear values, and
+            // telling the compositor the wrong one crushes or washes out the mid-tones.
             var texture = new Texture_t
             {
                 handle = eyeTexture.GetNativeTexturePtr(),
                 eType = ETextureType.DirectX,
-                eColorSpace = EColorSpace.Gamma
+                eColorSpace = eyeTexture.sRGB ? EColorSpace.Gamma : EColorSpace.Linear
             };
 
+            // Always the full texture: the eye's view already fills it, because the crop is
+            // applied when we copy into this texture rather than being delegated to the
+            // compositor.
             var bounds = FullTextureBounds;
             var err = compositor.Submit(eye, ref texture, ref bounds, EVRSubmitFlags.Submit_Default);
 
@@ -729,7 +1433,13 @@ namespace NirvanaVR
 
         private static Vector3 GetRecenteredPosition()
         {
-            return Quaternion.AngleAxis(-_yawOffsetDeg, Vector3.up) * _hmdPosRaw;
+            // Scaled by _headTranslationScale (F1/F2). Rotating your head also MOVES the
+            // headset - it pivots about your neck, not your eyes - and we feed that
+            // translation into the game in metres. If the game's world isn't built at
+            // 1 unit = 1 metre, that movement is scaled wrong, so turning your head gives
+            // too much or too little parallax and objects appear to swell and shrink as you
+            // look around, without any straight line ever bending.
+            return Quaternion.AngleAxis(-_yawOffsetDeg, Vector3.up) * _hmdPosRaw * _headTranslationScale;
         }
 
         // OpenVR (right-handed, -Z forward) -> Unity (left-handed, +Z forward).

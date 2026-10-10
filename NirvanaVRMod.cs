@@ -37,11 +37,35 @@ namespace NirvanaVR
         {
             VRHead.PumpPoses();
 
+            if (Input.GetKeyDown(KeyCode.F1))
+                VRHead.AdjustHeadTranslationScale(-0.25f);
+
+            if (Input.GetKeyDown(KeyCode.F2))
+                VRHead.AdjustHeadTranslationScale(0.25f);
+
+            if (Input.GetKeyDown(KeyCode.F3))
+                VRHead.AdjustCameraPullback(-0.25f);
+
+            if (Input.GetKeyDown(KeyCode.F4))
+                VRHead.AdjustCameraPullback(0.25f);
+
+            if (Input.GetKeyDown(KeyCode.F5))
+                VRHead.AdjustIpdScale(-0.25f);
+
+            if (Input.GetKeyDown(KeyCode.F6))
+                VRHead.AdjustIpdScale(0.25f);
+
+            if (Input.GetKeyDown(KeyCode.F7))
+                VRHead.ToggleLeftEyeScreenMirror();
+
+            if (Input.GetKeyDown(KeyCode.F8))
+                VRHead.ToggleEyeProjection();
+
             if (Input.GetKeyDown(KeyCode.F9))
                 VRHead.RecenterYaw();
 
             if (Input.GetKeyDown(KeyCode.F10))
-                VRHead.ToggleLeftEyeScreenMirror();
+                VRHead.ToggleLevelHorizon();
 
             if (Input.GetKeyDown(KeyCode.F11))
                 VRHead.ToggleEyeTextureResolution();
