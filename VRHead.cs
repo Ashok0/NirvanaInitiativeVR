@@ -109,6 +109,10 @@ namespace NirvanaVR
         // in a single session instead of one game restart per attempt.
         private static bool UseScreenSizedEyeTextures = false;
 
+        // Multiplies whichever eye size was chosen above (0.7 = ~49% of the pixels, ~49% of
+        // the fill-rate cost of the two eye cameras). See the comment where this is applied.
+        private const float EyeResolutionScale = 0.7f;
+
         // Mono mirror mode (F12). Instead of rendering the scene ourselves, copy the game's
         // own finished frame into both eye textures. No parallax, but the view is still
         // head-tracked (the game's camera carries the HMD pose), and it isolates the
@@ -190,21 +194,31 @@ namespace NirvanaVR
             if (compositor == null)
                 return;
 
-            // Copy FIRST, then submit. The eye render targets hold last frame's render, so
-            // copying before submitting hands the compositor a one-frame-old image instead
-            // of a two-frame-old one. The old order (submit, then copy) meant we submitted
-            // the copy made last frame - which had itself captured the frame before that -
-            // while the compositor reprojected it as if current. That extra frame of stale
-            // pose is what makes the world swim and warp as the head turns.
-            MirrorGameFrameToEyes();
-            CaptureRenderedEye();
-
-            // Skipped when submitting immediately from the render callback instead.
-            if (_stereoRigCreated
-                && _leftSubmitTexture != null && _rightSubmitTexture != null)
+            // Same guard EnsureStereoRig uses before touching cameras/textures/the
+            // compositor. Without it we kept submitting cross-process D3D11 textures every
+            // single frame even while this app didn't actually have scene focus (dashboard
+            // open, a scene transition still streaming assets, etc.) - exactly the kind of
+            // GPU/IPC pressure that showed up earlier as compositor hangs, just continuous
+            // instead of only on rig rebuild. No point doing the blit work either if the
+            // submit that follows it would just be skipped.
+            if (compositor.CanRenderScene())
             {
-                SubmitEye(EVREye.Eye_Left, _leftSubmitTexture);
-                SubmitEye(EVREye.Eye_Right, _rightSubmitTexture);
+                // Copy FIRST, then submit. The eye render targets hold last frame's render,
+                // so copying before submitting hands the compositor a one-frame-old image
+                // instead of a two-frame-old one. The old order (submit, then copy) meant we
+                // submitted the copy made last frame - which had itself captured the frame
+                // before that - while the compositor reprojected it as if current. That extra
+                // frame of stale pose is what makes the world swim and warp as the head turns.
+                MirrorGameFrameToEyes();
+                CaptureRenderedEye();
+
+                // Skipped when submitting immediately from the render callback instead.
+                if (_stereoRigCreated
+                    && _leftSubmitTexture != null && _rightSubmitTexture != null)
+                {
+                    SubmitEye(EVREye.Eye_Left, _leftSubmitTexture);
+                    SubmitEye(EVREye.Eye_Right, _rightSubmitTexture);
+                }
             }
 
             // Submit-then-wait is the intended OpenVR order: the wait blocks until the
@@ -255,9 +269,6 @@ namespace NirvanaVR
             BlitEye(_leftEyeTexture, _leftSubmitTexture, _leftCrop);
             BlitEye(_rightEyeTexture, _rightSubmitTexture, _rightCrop);
 
-            // The game's 2D interface, drawn over both eyes - see VRUI.
-            VRUI.Composite(_leftSubmitTexture, EVREye.Eye_Left);
-            VRUI.Composite(_rightSubmitTexture, EVREye.Eye_Right);
         }
 
         private static void BlitEye(RenderTexture source, RenderTexture destination, Rect crop)
@@ -973,6 +984,15 @@ namespace NirvanaVR
                 height = (uint)Screen.height;
             }
 
+            // Safety default while this machine's GPU is showing driver instability under
+            // sustained load (a TDR recovery and a full lockup, both logged the same day this
+            // stereo rig went in). Three full scene renders a frame at the HMD's full
+            // recommended size (1344x1440/eye here) is a lot of sustained pixel-fill; this
+            // trims it without changing anything structural. Safe to raise back to 1.0 once
+            // stability is confirmed.
+            width = (uint)(width * EyeResolutionScale);
+            height = (uint)(height * EyeResolutionScale);
+
             _leftEyeTexture = CreateEyeTexture(width, height, "NirvanaVR_LeftEyeRT", mainCamera);
             _rightEyeTexture = CreateEyeTexture(width, height, "NirvanaVR_RightEyeRT", mainCamera);
             _leftSubmitTexture = CreateSubmitTexture(width, height, "NirvanaVR_LeftSubmitRT");
@@ -1126,6 +1146,7 @@ namespace NirvanaVR
             // but our RT was only ever written once and then sat frozen, which is exactly
             // the stale grey image in the headset. Copy the fields we actually want.
             cam.cullingMask = mainCamera.cullingMask;
+            VRUI.IncludeUiLayer(cam);
             cam.nearClipPlane = mainCamera.nearClipPlane;
             cam.farClipPlane = mainCamera.farClipPlane;
             cam.renderingPath = mainCamera.renderingPath;
