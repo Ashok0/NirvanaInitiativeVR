@@ -1,0 +1,6 @@
+C:\Users\Ashok\source\repos\PathologicVR\PathologicVR\bin\Release\PathologicVR.dll
+C:\Users\Ashok\source\repos\PathologicVR\PathologicVR\bin\Release\PathologicVR.pdb
+C:\Users\Ashok\source\repos\PathologicVR\PathologicVR\obj\Release\PathologicVR.csproj.AssemblyReference.cache
+C:\Users\Ashok\source\repos\PathologicVR\PathologicVR\obj\Release\PathologicVR.csproj.CoreCompileInputs.cache
+C:\Users\Ashok\source\repos\PathologicVR\PathologicVR\obj\Release\PathologicVR.dll
+C:\Users\Ashok\source\repos\PathologicVR\PathologicVR\obj\Release\PathologicVR.pdb

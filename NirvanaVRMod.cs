@@ -40,6 +40,15 @@ namespace NirvanaVR
             if (Input.GetKeyDown(KeyCode.F9))
                 VRHead.RecenterYaw();
 
+            if (Input.GetKeyDown(KeyCode.F10))
+                VRHead.ToggleLeftEyeScreenMirror();
+
+            if (Input.GetKeyDown(KeyCode.F11))
+                VRHead.ToggleEyeTextureResolution();
+
+            if (Input.GetKeyDown(KeyCode.F12))
+                VRHead.ToggleGameFrameMirror();
+
             DisableCinemachineHeadControl();
         }
 
@@ -49,12 +58,24 @@ namespace NirvanaVR
         /// </summary>
         private void DisableCinemachineHeadControl()
         {
-            if (_mainCameraObject == null)
+            // Re-find whenever the cached object is gone OR merely inactive: a scene change
+            // can swap in a brand new "Main Camera" and leave the old one alive but
+            // deactivated, which a plain null check won't catch. GameObject.Find only
+            // returns active objects, so this always re-homes us onto the live one.
+            if (_mainCameraObject == null || !_mainCameraObject.activeInHierarchy)
             {
                 _mainCameraObject = GameObject.Find("Main Camera");
                 if (_mainCameraObject == null)
                     return;
+
+                // Cached components belonged to the previous Main Camera - drop them.
+                _brain = null;
+                _lastVcamObject = null;
+                _customAxis = null;
+                _offsetRotation = null;
             }
+
+            VRHead.EnsureStereoRig(_mainCameraObject);
 
             if (_brain == null)
             {

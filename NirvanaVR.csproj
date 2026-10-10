@@ -82,6 +82,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- p2/ holds the Pathologic 2 mod purely as a reference to read; it must never be
+         compiled into this project (it has its own copy of openvr_api.cs, which would
+         collide with ours, and targets BepInEx rather than MelonLoader). -->
+    <Compile Remove="p2/**/*.cs" />
+    <None Remove="p2/**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Explicitly linked rather than picked up by the default SDK glob -->
     <Compile Remove="openvr_api.cs" />
     <Compile Include="openvr_api.cs" Link="openvr_api.cs" Condition="Exists('openvr_api.cs')" />
