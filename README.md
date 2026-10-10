@@ -1,1 +1,1 @@
-# NirvanaInitiativeVR
+# Nirvana Initiative VR
